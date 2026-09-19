@@ -1,0 +1,215 @@
+name: Build StudyTracker.io APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract complete project
+        run: |
+          rm -rf project
+          mkdir project
+          unzip -q StudyTrackerIO_PRO_FINAL_COMPLETE.zip -d project
+
+      - name: Fix Android package configuration
+        working-directory: project/StudyTrackerIO_Pro
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("capacitor.config.js")
+          s = p.read_text()
+
+          s = s.replace(
+              "com.piyushsinha.studytracker",
+              "org.studytracker.app"
+          )
+
+          p.write_text(s)
+          print(p.read_text())
+          PY
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install dependencies
+        working-directory: project/StudyTrackerIO_Pro
+        run: npm install
+
+      - name: Create Android project
+        working-directory: project/StudyTrackerIO_Pro
+        run: npx cap add android
+
+      - name: Add AndroidX Core
+        working-directory: project/StudyTrackerIO_Pro/android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("app/build.gradle")
+          s = p.read_text()
+
+          dependency = "    implementation 'androidx.core:core:1.15.0'\n"
+
+          if "androidx.core:core:" not in s:
+              s = s.replace(
+                  "dependencies {",
+                  "dependencies {\n" + dependency,
+                  1
+              )
+
+          p.write_text(s)
+          PY
+
+      - name: Install native timer and notification code
+        working-directory: project/StudyTrackerIO_Pro
+        run: |
+          mkdir -p android/app/src/main/java/org/studytracker/app
+
+          cp android_patch/StudyTimerPlugin.java \
+             android/app/src/main/java/org/studytracker/app/
+
+          cp android_patch/StudyTimerService.java \
+             android/app/src/main/java/org/studytracker/app/
+
+          cp android_patch/src/main/java/org/studytracker/app/StudyNotificationsPlugin.java \
+             android/app/src/main/java/org/studytracker/app/
+
+          cp android_patch/src/main/java/org/studytracker/app/StudyReminderScheduler.java \
+             android/app/src/main/java/org/studytracker/app/
+
+          cp android_patch/src/main/java/org/studytracker/app/StudyReminderReceiver.java \
+             android/app/src/main/java/org/studytracker/app/
+
+          cp android_patch/src/main/java/org/studytracker/app/StudyReminderBootReceiver.java \
+             android/app/src/main/java/org/studytracker/app/
+
+      - name: Register native plugins
+        working-directory: project/StudyTrackerIO_Pro
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "android/app/src/main/java/org/studytracker/app/MainActivity.java"
+          )
+
+          s = p.read_text()
+
+          if "StudyTimerPlugin.class" not in s:
+              s = s.replace(
+                  "public class MainActivity extends BridgeActivity {",
+                  """public class MainActivity extends BridgeActivity {
+
+              @Override
+              public void onCreate(android.os.Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  registerPlugin(StudyTimerPlugin.class);
+                  registerPlugin(StudyNotificationsPlugin.class);
+              }""",
+                  1
+              )
+
+          p.write_text(s)
+          PY
+
+      - name: Configure Android permissions
+        working-directory: project/StudyTrackerIO_Pro
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/app/src/main/AndroidManifest.xml")
+          s = p.read_text()
+
+          permissions = [
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+              '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
+              '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />',
+              '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />'
+          ]
+
+          for permission in permissions:
+              if permission not in s:
+                  s = s.replace(
+                      "<application",
+                      permission + "\n\n    <application",
+                      1
+                  )
+
+          native_components = """
+              <service
+                  android:name=".StudyTimerService"
+                  android:enabled="true"
+                  android:exported="false"
+                  android:foregroundServiceType="specialUse">
+
+                  <property
+                      android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                      android:value="Study timer that continues while the screen is off." />
+              </service>
+
+              <receiver
+                  android:name=".StudyReminderReceiver"
+                  android:enabled="true"
+                  android:exported="false" />
+
+              <receiver
+                  android:name=".StudyReminderBootReceiver"
+                  android:enabled="true"
+                  android:exported="true">
+
+                  <intent-filter>
+                      <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                  </intent-filter>
+
+              </receiver>
+          """
+
+          if "android:name=\".StudyTimerService\"" not in s:
+              s = s.replace(
+                  "</application>",
+                  native_components + "\n    </application>",
+                  1
+              )
+
+          p.write_text(s)
+          PY
+
+      - name: Sync Capacitor
+        working-directory: project/StudyTrackerIO_Pro
+        run: npx cap sync android
+
+      - name: Build APK
+        working-directory: project/StudyTrackerIO_Pro/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: StudyTrackerIO-APK
+          path: project/StudyTrackerIO_Pro/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
